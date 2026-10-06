@@ -1,0 +1,7 @@
+.*
+!.envrc
+!.gitignore
+!.github
+!.yamllint.yaml
+/build/
+/result*

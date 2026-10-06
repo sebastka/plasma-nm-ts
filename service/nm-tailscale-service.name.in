@@ -1,0 +1,5 @@
+[VPN Connection]
+name=tailscale
+service=org.freedesktop.NetworkManager.tailscale
+program=@CMAKE_INSTALL_FULL_LIBEXECDIR@/nm-tailscale-service
+supports-multiple-connections=false
