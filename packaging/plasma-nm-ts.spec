@@ -44,8 +44,13 @@ made with the tailscale command are reflected in NetworkManager.
 %autosetup
 
 %build
-%{!?plasma_nm_source:%{error:define plasma_nm_source, see packaging/build-rpm.sh}}
-%cmake -DPLASMA_NM_SOURCE_DIR=%{plasma_nm_source}
+# A shell check: rpm expands macros such as %%{error:} when parsing the spec,
+# which dnf builddep does before plasma_nm_source can be known
+if [ -z "%{?plasma_nm_source}" ]; then
+    echo "define plasma_nm_source, see packaging/build-rpm.sh" >&2
+    exit 1
+fi
+%cmake -DPLASMA_NM_SOURCE_DIR=%{?plasma_nm_source}
 %cmake_build
 
 %install
