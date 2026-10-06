@@ -6,6 +6,7 @@ pkg_check_modules(SERVICE_DEPS REQUIRED IMPORTED_TARGET
 )
 
 add_executable(nm-tailscale-service nm-tailscale-service.c)
+target_include_directories(nm-tailscale-service PRIVATE ${PROJECT_SOURCE_DIR}/common)
 target_link_libraries(nm-tailscale-service PRIVATE PkgConfig::SERVICE_DEPS)
 target_compile_options(nm-tailscale-service PRIVATE -Wall -Wextra -Wno-unused-parameter)
 install(TARGETS nm-tailscale-service DESTINATION ${CMAKE_INSTALL_LIBEXECDIR})

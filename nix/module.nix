@@ -1,4 +1,3 @@
-self:
 {
   config,
   lib,
@@ -14,8 +13,9 @@ in
     enable = lib.mkEnableOption "Tailscale profiles as NetworkManager VPN connections";
     package = lib.mkOption {
       type = lib.types.package;
-      default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-      defaultText = lib.literalExpression "plasma-nm-ts.packages.\${system}.default";
+      # Built from the system's nixpkgs, so the plasma-nm plugin matches the installed plasma-nm
+      default = pkgs.kdePackages.callPackage ./package.nix { };
+      defaultText = lib.literalExpression "pkgs.kdePackages.callPackage ./package.nix { }";
       description = "The plasma-nm-ts package to use.";
     };
   };
@@ -32,5 +32,8 @@ in
 
     # NetworkManager only discovers VPN plugins at startup
     systemd.services.NetworkManager.restartTriggers = [ cfg.package ];
+
+    # The plasma-nm plugin is found through /run/current-system/sw/lib/qt-6/plugins
+    environment.systemPackages = [ cfg.package ];
   };
 }
