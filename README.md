@@ -54,6 +54,12 @@ nmcli connection up "Tailscale (private)"
 
 Optional `vpn.data` key: `interface` (default `tailscale0`).
 
+tailscaled runs one profile at a time. Connecting another Tailscale connection
+switches tailscaled to its profile, and the previous connection disconnects
+itself without stopping Tailscale. Changes made outside NetworkManager
+(`tailscale down`, `tailscale switch`, an expired login) also disconnect the
+connection in NetworkManager.
+
 ## Development
 
 ```sh
@@ -67,6 +73,7 @@ cmake -B build -DBUILD_PLASMA_NM_PLUGIN=OFF
 # Exercise the LocalAPI path without NetworkManager (needs root or --operator)
 ./build/service/nm-tailscale-service --test-up <profile>
 ./build/service/nm-tailscale-service --test-down
+./build/service/nm-tailscale-service --test-watch <profile>   # reports when a connection would drop
 
 # Plugin logs
 journalctl -u NetworkManager -f
