@@ -318,7 +318,13 @@ build_vpn_config(JsonObject *status, const char *iface, GError **error)
 #define WATCH_RETRY_MS        2000
 #define WATCH_MAX_FAILURES    15 /* tailscaled unreachable for ~30s */
 
-typedef void (*WatchReleaseFunc)(const char *reason, gboolean needs_login, gpointer user_data);
+typedef enum {
+    WATCH_RELEASE_EXPECTED, /* tailscaled moved on: a normal disconnect */
+    WATCH_RELEASE_LOGIN,
+    WATCH_RELEASE_FAILED,
+} WatchRelease;
+
+typedef void (*WatchReleaseFunc)(const char *reason, WatchRelease kind, gpointer user_data);
 
 typedef struct {
     SoupSession *api;    /* borrowed, for short requests */
@@ -331,7 +337,7 @@ typedef struct {
     guint release_id;
     guint failures;
     char *release_reason;
-    gboolean release_needs_login;
+    WatchRelease release_kind;
     WatchReleaseFunc release;
     gpointer user_data;
 } Watch;
@@ -366,11 +372,11 @@ watch_release_cb(gpointer user_data)
     WatchReleaseFunc release = w->release;
     gpointer release_data = w->user_data;
     g_autofree char *reason = g_steal_pointer(&w->release_reason);
-    gboolean needs_login = w->release_needs_login;
+    WatchRelease kind = w->release_kind;
 
     w->release_id = 0;
     /* May free the watch: do not touch it afterwards */
-    release(reason, needs_login, release_data);
+    release(reason, kind, release_data);
     return G_SOURCE_REMOVE;
 }
 
@@ -400,6 +406,7 @@ watch_check_cb(gpointer user_data)
             return G_SOURCE_REMOVE;
         }
         reason = "tailscaled is unreachable";
+        w->release_kind = WATCH_RELEASE_FAILED;
     } else {
         w->failures = 0;
         state = json_member_str(json_obj(status), "BackendState");
@@ -409,7 +416,7 @@ watch_check_cb(gpointer user_data)
             reason = "Tailscale was stopped";
         else if (g_strcmp0(state, "NeedsLogin") == 0 || g_strcmp0(state, "NeedsMachineAuth") == 0) {
             reason = "the Tailscale profile needs to log in again";
-            w->release_needs_login = TRUE;
+            w->release_kind = WATCH_RELEASE_LOGIN;
         }
     }
 
@@ -523,6 +530,7 @@ typedef struct {
     SoupSession *session;
     char *interface;
     char *profile_id;
+    char *uuid; /* of the NetworkManager connection */
     guint poll_id;
     gint64 deadline;
     Watch *watch;
@@ -538,17 +546,98 @@ G_DEFINE_TYPE(NMTailscalePlugin, nm_tailscale_plugin, NM_TYPE_VPN_SERVICE_PLUGIN
 
 #define NM_TAILSCALE_PLUGIN(o) (G_TYPE_CHECK_INSTANCE_CAST((o), nm_tailscale_plugin_get_type(), NMTailscalePlugin))
 
+static GVariant *
+nm_dbus_get_property(GDBusConnection *bus, const char *path, const char *iface, const char *name, GError **error)
+{
+    g_autoptr(GVariant) reply = g_dbus_connection_call_sync(bus, NM_DBUS_SERVICE, path, "org.freedesktop.DBus.Properties",
+                                                            "Get", g_variant_new("(ss)", iface, name),
+                                                            G_VARIANT_TYPE("(v)"), G_DBUS_CALL_FLAGS_NONE, 5000, NULL,
+                                                            error);
+    GVariant *value = NULL;
+
+    if (reply)
+        g_variant_get(reply, "(v)", &value);
+    return value;
+}
+
+/* Object path of the active connection with this UUID, or NULL. */
+static char *
+find_active_connection(GDBusConnection *bus, const char *uuid, GError **error)
+{
+    g_autoptr(GVariant) actives =
+        nm_dbus_get_property(bus, NM_DBUS_PATH, NM_DBUS_INTERFACE, "ActiveConnections", error);
+    GVariantIter iter;
+    const char *path;
+
+    if (!actives)
+        return NULL;
+    g_variant_iter_init(&iter, actives);
+    while (g_variant_iter_next(&iter, "&o", &path)) {
+        g_autoptr(GVariant) value =
+            nm_dbus_get_property(bus, path, NM_DBUS_INTERFACE_ACTIVE_CONNECTION, "Uuid", NULL);
+
+        if (value && g_strcmp0(g_variant_get_string(value, NULL), uuid) == 0)
+            return g_strdup(path);
+    }
+    return NULL;
+}
+
 static void
-on_watch_release(const char *reason, gboolean needs_login, gpointer user_data)
+deactivate_cb(GObject *source, GAsyncResult *result, gpointer user_data)
+{
+    NMTailscalePlugin *self = user_data;
+    g_autoptr(GError) error = NULL;
+    g_autoptr(GVariant) reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), result, &error);
+
+    if (!reply) {
+        g_warning("could not deactivate the connection through NetworkManager: %s", error->message);
+        nm_vpn_service_plugin_disconnect(NM_VPN_SERVICE_PLUGIN(self), NULL);
+    }
+    g_object_unref(self);
+}
+
+/* Deactivates the connection as a user would, so that NetworkManager and
+ * plasma-nm report a normal disconnection rather than a failure. Asynchronous:
+ * NetworkManager calls back into this plugin's Disconnect before replying. */
+static gboolean
+deactivate_through_nm(NMTailscalePlugin *self, GError **error)
+{
+    g_autoptr(GDBusConnection) bus = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, error);
+    g_autofree char *path = NULL;
+
+    if (!bus)
+        return FALSE;
+    path = find_active_connection(bus, self->uuid, error);
+    if (!path) {
+        if (error && !*error)
+            g_set_error(error, NM_VPN_PLUGIN_ERROR, NM_VPN_PLUGIN_ERROR_FAILED, "active connection not found");
+        return FALSE;
+    }
+
+    g_dbus_connection_call(bus, NM_DBUS_SERVICE, NM_DBUS_PATH, NM_DBUS_INTERFACE, "DeactivateConnection",
+                           g_variant_new("(o)", path), NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, deactivate_cb,
+                           g_object_ref(self));
+    return TRUE;
+}
+
+static void
+on_watch_release(const char *reason, WatchRelease kind, gpointer user_data)
 {
     NMTailscalePlugin *self = user_data;
     NMVpnServicePlugin *plugin = NM_VPN_SERVICE_PLUGIN(self);
+    g_autoptr(GError) error = NULL;
 
     g_message("%s, disconnecting", reason);
     self->released = TRUE;
     g_clear_pointer(&self->watch, watch_free);
-    if (needs_login)
+
+    if (kind == WATCH_RELEASE_EXPECTED) {
+        if (deactivate_through_nm(self, &error))
+            return;
+        g_warning("could not deactivate the connection through NetworkManager: %s", error->message);
+    } else if (kind == WATCH_RELEASE_LOGIN) {
         nm_vpn_service_plugin_failure(plugin, NM_VPN_PLUGIN_FAILURE_LOGIN_FAILED);
+    }
     nm_vpn_service_plugin_disconnect(plugin, NULL);
 }
 
@@ -609,6 +698,8 @@ real_connect(NMVpnServicePlugin *plugin, NMConnection *connection, GError **erro
     self->interface = g_strdup(iface && *iface ? iface : DEFAULT_INTERFACE);
     self->released = FALSE;
     g_clear_pointer(&self->watch, watch_free);
+    g_free(self->uuid);
+    self->uuid = g_strdup(nm_connection_get_uuid(connection));
 
     g_free(self->profile_id);
     self->profile_id = resolve_profile_id(self->session, profile, error);
@@ -671,6 +762,7 @@ nm_tailscale_plugin_dispose(GObject *object)
     g_clear_object(&self->session);
     g_clear_pointer(&self->interface, g_free);
     g_clear_pointer(&self->profile_id, g_free);
+    g_clear_pointer(&self->uuid, g_free);
     G_OBJECT_CLASS(nm_tailscale_plugin_parent_class)->dispose(object);
 }
 
@@ -690,9 +782,10 @@ nm_tailscale_plugin_class_init(NMTailscalePluginClass *klass)
 /* Standalone test mode: exercises the LocalAPI path without NetworkManager. */
 
 static void
-test_watch_release(const char *reason, gboolean needs_login, gpointer user_data)
+test_watch_release(const char *reason, WatchRelease kind, gpointer user_data)
 {
-    printf("would disconnect: %s%s\n", reason, needs_login ? " (login failure)" : "");
+    printf("would disconnect: %s (%s)\n", reason,
+           kind == WATCH_RELEASE_EXPECTED ? "deactivate" : kind == WATCH_RELEASE_LOGIN ? "login failure" : "failure");
     fflush(stdout);
     g_main_loop_quit(user_data);
 }
