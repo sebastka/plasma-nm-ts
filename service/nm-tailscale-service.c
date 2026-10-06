@@ -193,31 +193,21 @@ tailscale_down(SoupSession *session, GError **error)
 /*****************************************************************************/
 /* NetworkManager configuration */
 
-typedef struct {
-    GVariant *config;
-    GVariant *ip4;
-    GVariant *ip6;
-} VpnConfig;
-
-static void
-vpn_config_clear(VpnConfig *c)
-{
-    g_clear_pointer(&c->config, g_variant_unref);
-    g_clear_pointer(&c->ip4, g_variant_unref);
-    g_clear_pointer(&c->ip6, g_variant_unref);
-}
-G_DEFINE_AUTO_CLEANUP_CLEAR_FUNC(VpnConfig, vpn_config_clear)
-
 /* Builds the configuration NetworkManager expects from a LocalAPI status
- * object. Only the tailnet addresses are reported: no routes, no DNS and
- * never-default, so NetworkManager does not compete with tailscaled.
+ * object.
+ *
+ * No IP configuration is reported (has-ip4 and has-ip6 are FALSE): tailscaled
+ * owns tailscale0's addresses, routes and DNS. If NetworkManager applied the
+ * addresses too, it would remove them on disconnect while tailscaled stops,
+ * and tailscaled would react to that link change by re-applying its tailnet
+ * DNS configuration after stopping, leaving resolv.conf pointing at it.
  *
  * NetworkManager rejects a config without an external gateway and adds a host
  * route to it via the parent device. Tailscale has no single gateway, so the
  * node's own tailnet address is reported: any such route is shadowed by the
  * local routing table and never used. */
-static gboolean
-build_vpn_config(JsonObject *status, const char *iface, VpnConfig *out, GError **error)
+static GVariant *
+build_vpn_config(JsonObject *status, const char *iface, GError **error)
 {
     JsonNode *ips_node = json_object_has_member(status, "TailscaleIPs")
                              ? json_object_get_member(status, "TailscaleIPs")
@@ -229,41 +219,30 @@ build_vpn_config(JsonObject *status, const char *iface, VpnConfig *out, GError *
     if (if_nametoindex(iface) == 0) {
         g_set_error(error, NM_VPN_PLUGIN_ERROR, NM_VPN_PLUGIN_ERROR_FAILED,
                     "interface %s not found (is tailscaled running in userspace-networking mode?)", iface);
-        return FALSE;
+        return NULL;
     }
 
+    /* Prefer the IPv4 address as gateway */
     for (guint i = 0; ips && i < json_array_get_length(ips); i++) {
         JsonNode *n = json_array_get_element(ips, i);
         const char *ip = JSON_NODE_HOLDS_VALUE(n) ? json_node_get_string(n) : NULL;
         struct in_addr a4;
         struct in6_addr a6;
-        GVariantBuilder b;
 
         if (!ip)
             continue;
-        if (!out->ip4 && inet_pton(AF_INET, ip, &a4) == 1) {
-            g_variant_builder_init(&b, G_VARIANT_TYPE_VARDICT);
-            g_variant_builder_add(&b, "{sv}", NM_VPN_PLUGIN_IP4_CONFIG_ADDRESS, g_variant_new_uint32(a4.s_addr));
-            g_variant_builder_add(&b, "{sv}", NM_VPN_PLUGIN_IP4_CONFIG_PREFIX, g_variant_new_uint32(32));
-            g_variant_builder_add(&b, "{sv}", NM_VPN_PLUGIN_IP4_CONFIG_NEVER_DEFAULT, g_variant_new_boolean(TRUE));
-            out->ip4 = g_variant_ref_sink(g_variant_builder_end(&b));
+        if (inet_pton(AF_INET, ip, &a4) == 1) {
             g_clear_pointer(&gateway, g_variant_unref);
             gateway = g_variant_ref_sink(g_variant_new_uint32(a4.s_addr));
-        } else if (!out->ip6 && inet_pton(AF_INET6, ip, &a6) == 1) {
-            g_variant_builder_init(&b, G_VARIANT_TYPE_VARDICT);
-            g_variant_builder_add(&b, "{sv}", NM_VPN_PLUGIN_IP6_CONFIG_ADDRESS,
-                                  g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, &a6, sizeof(a6), 1));
-            g_variant_builder_add(&b, "{sv}", NM_VPN_PLUGIN_IP6_CONFIG_PREFIX, g_variant_new_uint32(128));
-            g_variant_builder_add(&b, "{sv}", NM_VPN_PLUGIN_IP6_CONFIG_NEVER_DEFAULT, g_variant_new_boolean(TRUE));
-            out->ip6 = g_variant_ref_sink(g_variant_builder_end(&b));
-            if (!gateway)
-                gateway = g_variant_ref_sink(g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, &a6, sizeof(a6), 1));
+            break;
         }
+        if (!gateway && inet_pton(AF_INET6, ip, &a6) == 1)
+            gateway = g_variant_ref_sink(g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, &a6, sizeof(a6), 1));
     }
 
-    if (!out->ip4 && !out->ip6) {
+    if (!gateway) {
         g_set_error(error, NM_VPN_PLUGIN_ERROR, NM_VPN_PLUGIN_ERROR_FAILED, "tailscaled reports no Tailscale IPs");
-        return FALSE;
+        return NULL;
     }
 
     g_variant_builder_init(&config, G_VARIANT_TYPE_VARDICT);
@@ -272,10 +251,9 @@ build_vpn_config(JsonObject *status, const char *iface, VpnConfig *out, GError *
     g_variant_unref(gateway);
     /* tailscaled survives link changes on its own, so vpn.persistent is safe */
     g_variant_builder_add(&config, "{sv}", NM_VPN_PLUGIN_CAN_PERSIST, g_variant_new_boolean(TRUE));
-    g_variant_builder_add(&config, "{sv}", NM_VPN_PLUGIN_CONFIG_HAS_IP4, g_variant_new_boolean(out->ip4 != NULL));
-    g_variant_builder_add(&config, "{sv}", NM_VPN_PLUGIN_CONFIG_HAS_IP6, g_variant_new_boolean(out->ip6 != NULL));
-    out->config = g_variant_ref_sink(g_variant_builder_end(&config));
-    return TRUE;
+    g_variant_builder_add(&config, "{sv}", NM_VPN_PLUGIN_CONFIG_HAS_IP4, g_variant_new_boolean(FALSE));
+    g_variant_builder_add(&config, "{sv}", NM_VPN_PLUGIN_CONFIG_HAS_IP6, g_variant_new_boolean(FALSE));
+    return g_variant_ref_sink(g_variant_builder_end(&config));
 }
 
 /*****************************************************************************/
@@ -307,16 +285,13 @@ poll_running(gpointer user_data)
     g_autoptr(GError) error = NULL;
     g_autoptr(JsonNode) status = localapi(self->session, "GET", "status?peers=false", NULL, &error);
     const char *state = json_member_str(json_obj(status), "BackendState");
-    g_auto(VpnConfig) cfg = {0};
+    g_autoptr(GVariant) config = NULL;
 
-    if (g_strcmp0(state, "Running") == 0 && build_vpn_config(json_obj(status), self->interface, &cfg, &error)) {
+    if (g_strcmp0(state, "Running") == 0
+        && (config = build_vpn_config(json_obj(status), self->interface, &error))) {
         g_message("Tailscale is running, reporting %s to NetworkManager", self->interface);
         self->poll_id = 0;
-        nm_vpn_service_plugin_set_config(plugin, cfg.config);
-        if (cfg.ip4)
-            nm_vpn_service_plugin_set_ip4_config(plugin, cfg.ip4);
-        if (cfg.ip6)
-            nm_vpn_service_plugin_set_ip6_config(plugin, cfg.ip6);
+        nm_vpn_service_plugin_set_config(plugin, config);
         return G_SOURCE_REMOVE;
     }
 
@@ -433,19 +408,18 @@ run_test(const char *profile, gboolean down)
     for (;;) {
         g_autoptr(JsonNode) status = localapi(session, "GET", "status?peers=false", NULL, &error);
         const char *state = json_member_str(json_obj(status), "BackendState");
-        g_auto(VpnConfig) cfg = {0};
+        g_autoptr(GVariant) config = NULL;
 
         if (!status)
             goto fail;
         if (g_strcmp0(state, "Running") == 0) {
-            g_autofree char *c = NULL, *ip4 = NULL, *ip6 = NULL;
+            g_autofree char *c = NULL;
 
-            if (!build_vpn_config(json_obj(status), DEFAULT_INTERFACE, &cfg, &error))
+            config = build_vpn_config(json_obj(status), DEFAULT_INTERFACE, &error);
+            if (!config)
                 goto fail;
-            c = g_variant_print(cfg.config, TRUE);
-            ip4 = cfg.ip4 ? g_variant_print(cfg.ip4, TRUE) : NULL;
-            ip6 = cfg.ip6 ? g_variant_print(cfg.ip6, TRUE) : NULL;
-            printf("config: %s\nip4:    %s\nip6:    %s\n", c, ip4 ? ip4 : "-", ip6 ? ip6 : "-");
+            c = g_variant_print(config, TRUE);
+            printf("config: %s\n", c);
             return 0;
         }
         if (g_get_monotonic_time() > deadline) {
