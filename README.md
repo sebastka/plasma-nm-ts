@@ -85,6 +85,25 @@ journalctl -u NetworkManager -f
 journalctl -u nm-tailscale-sync -f
 ```
 
+## Releases
+
+GitHub releases carry `.deb` packages for Debian 13 and `.rpm` packages for
+Fedora 44, for x86_64 and aarch64. The plasma-nm plugin is built against that
+distribution's plasma-nm, so the packages only fit those distributions.
+
+To release: bump the version everywhere `scripts/check-version.sh` looks (and
+add a `%changelog` entry to `packaging/plasma-nm-ts.spec`) in a pull request,
+then run the *Release* workflow on `master` with that version. It validates the
+commit, builds every package, and only then tags `vX.Y.Z` and publishes the
+release. Its `dry_run` option stops before tagging.
+
+Packages can also be built locally in a container:
+
+```sh
+docker run --rm -v "$PWD:/src" -w /src debian:trixie packaging/build-deb.sh
+docker run --rm -v "$PWD:/src" -w /src fedora:44 packaging/build-rpm.sh
+```
+
 ## License
 
 GPL-2.0-or-later, like plasma-nm. See [LICENSE](LICENSE).

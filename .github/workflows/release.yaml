@@ -1,0 +1,179 @@
+---
+name: Release
+
+# Run manually with a version to release it: after validating the commit, it
+# builds the .deb (Debian 13) and .rpm (Fedora 44) for x86_64 and aarch64, and
+# only then tags vX.Y.Z and publishes the GitHub release. A failed build leaves
+# no tag behind.
+#
+# Nothing here commits. Bump the version in a normal pull request first
+# (scripts/check-version.sh lists where it is declared); this workflow only
+# verifies the tree agrees with itself, builds and tags it.
+#
+# Pull requests touching the packaging run the same builds, without publishing.
+'on':
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, without the leading v (e.g. 0.2.0)'
+        required: true
+        type: string
+      dry_run:
+        description: 'Validate and build only: do not tag or publish'
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - packaging/**
+      - scripts/**
+      - .github/workflows/release.yaml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  validate:
+    # Job names start with "release: " so that the green-commit check below
+    # can leave this workflow's own check runs out.
+    name: 'release: validate'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0  # tags, so the "already released" check is meaningful
+
+      - name: Check the version
+        id: version
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ]; then
+            echo "version=$(scripts/check-version.sh)" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'$VERSION' is not MAJOR.MINOR.PATCH. No leading v, no pre-release suffix."
+            exit 1
+          fi
+          if ! scripts/check-version.sh "$VERSION"; then
+            echo "::error::The declared versions do not all say $VERSION. Bump them in a pull request first."
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::v$VERSION already exists. Releases are immutable; pick the next version."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "publish=$([ "$DRY_RUN" = true ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+        env:
+          VERSION: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
+
+      - name: Check the branch
+        if: github.event_name == 'workflow_dispatch' && !inputs.dry_run
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo "::error::Releases are made from $DEFAULT_BRANCH, not $GITHUB_REF."
+            exit 1
+          fi
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+
+      - name: Confirm the release commit is green
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          checks=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100" \
+            --jq '[.check_runs[] | select(.name | startswith("release: ") | not)]')
+          total=$(printf '%s' "$checks" | jq length)
+          bad=$(printf '%s' "$checks" | jq -r '[.[] | select(.conclusion != "success"
+            and .conclusion != "skipped" and .conclusion != "neutral")
+            | "\(.name) (\(.conclusion // .status))"] | join(", ")')
+          echo "checks on this commit: $total"
+          if [ "$total" -eq 0 ] || [ -n "$bad" ]; then
+            echo "::error::This commit has no checks, or not all passed: ${bad:-none ran}. Refusing to release it."
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  deb:
+    name: 'release: deb (Debian 13, ${{ matrix.arch }})'
+    needs: validate
+    strategy:
+      matrix:
+        include:
+          - {arch: amd64, runner: ubuntu-latest}
+          - {arch: arm64, runner: ubuntu-24.04-arm}
+    runs-on: ${{ matrix.runner }}
+    container: debian:trixie
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - run: packaging/build-deb.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: deb-${{ matrix.arch }}
+          path: packaging/out/*.deb
+          if-no-files-found: error
+
+  rpm:
+    name: 'release: rpm (Fedora 44, ${{ matrix.arch }})'
+    needs: validate
+    strategy:
+      matrix:
+        include:
+          - {arch: x86_64, runner: ubuntu-latest}
+          - {arch: aarch64, runner: ubuntu-24.04-arm}
+    runs-on: ${{ matrix.runner }}
+    container: fedora:44
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - run: packaging/build-rpm.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: rpm-${{ matrix.arch }}
+          # Debuginfo and debugsource packages are left out
+          path: packaging/out/*/plasma-nm-ts-${{ needs.validate.outputs.version }}-*.rpm
+          if-no-files-found: error
+
+  publish:
+    name: 'release: publish v${{ needs.validate.outputs.version }}'
+    needs: [validate, deb, rpm]
+    if: needs.validate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          find . -mindepth 2 -type f \( -name '*.rpm' -o -name '*.deb' \) -exec mv {} . \;
+          sha256sum -- *.rpm *.deb > SHA256SUMS
+          cat SHA256SUMS
+      # Only now that every package built: a failed build leaves no tag
+      - name: Tag the release
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+          git push origin "v$VERSION"
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3.0.3
+        with:
+          tag_name: v${{ needs.validate.outputs.version }}
+          files: |
+            dist/*.rpm
+            dist/*.deb
+            dist/SHA256SUMS
+          generate_release_notes: true
