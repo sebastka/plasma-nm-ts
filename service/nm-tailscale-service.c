@@ -306,174 +306,121 @@ build_vpn_config(JsonObject *status, const char *iface, GError **error)
 }
 
 /*****************************************************************************/
-/* Watch: once connected, follow tailscaled's IPN bus and release the
- * connection when it no longer reflects tailscaled's state: another profile
- * became active (another connection, or 'tailscale switch'), Tailscale was
- * stopped ('tailscale down'), or the profile needs to log in again.
- *
- * Bus messages only trigger a check; the decision is always made from fresh
- * LocalAPI state, so missed or unknown messages cannot cause a wrong one. */
+/* BusWatch: follows tailscaled's IPN bus and calls back, debounced, whenever
+ * the state, profile or prefs may have changed. Bus messages are only used as
+ * triggers: callers always decide from fresh LocalAPI state, so missed or
+ * unknown messages cannot cause a wrong decision. While tailscaled is
+ * unreachable, the callback still fires on every reconnection attempt. */
 
-#define WATCH_DEBOUNCE_MS     300
-#define WATCH_RETRY_MS        2000
-#define WATCH_MAX_FAILURES    15 /* tailscaled unreachable for ~30s */
+#define WATCH_DEBOUNCE_MS  300
+#define WATCH_RETRY_MS     2000
+#define WATCH_MAX_FAILURES 15 /* tailscaled unreachable for ~30s */
 
-typedef enum {
-    WATCH_RELEASE_EXPECTED, /* tailscaled moved on: a normal disconnect */
-    WATCH_RELEASE_LOGIN,
-    WATCH_RELEASE_FAILED,
-} WatchRelease;
-
-typedef void (*WatchReleaseFunc)(const char *reason, WatchRelease kind, gpointer user_data);
+typedef void (*BusWatchFunc)(gpointer user_data);
 
 typedef struct {
-    SoupSession *api;    /* borrowed, for short requests */
-    SoupSession *stream; /* owned, without timeout: the bus is idle for long */
-    char *profile_id;
+    SoupSession *stream; /* without timeout: the bus is idle for long */
     GCancellable *cancellable;
     GDataInputStream *lines;
-    gboolean opening;
-    guint check_id;
-    guint release_id;
-    guint failures;
-    char *release_reason;
-    WatchRelease release_kind;
-    WatchReleaseFunc release;
+    guint changed_id;
+    guint reopen_id;
+    BusWatchFunc changed;
     gpointer user_data;
-} Watch;
+} BusWatch;
 
-static void watch_open(Watch *w);
+static void bus_watch_open(BusWatch *w);
 
 static void
-watch_close_stream(Watch *w)
+bus_watch_close_stream(BusWatch *w)
 {
     g_cancellable_cancel(w->cancellable);
     g_clear_object(&w->cancellable);
     g_clear_object(&w->lines);
-    w->opening = FALSE;
 }
 
 static void
-watch_free(Watch *w)
+bus_watch_free(BusWatch *w)
 {
-    watch_close_stream(w);
-    g_clear_handle_id(&w->check_id, g_source_remove);
-    g_clear_handle_id(&w->release_id, g_source_remove);
+    bus_watch_close_stream(w);
+    g_clear_handle_id(&w->changed_id, g_source_remove);
+    g_clear_handle_id(&w->reopen_id, g_source_remove);
     g_clear_object(&w->stream);
-    g_free(w->profile_id);
-    g_free(w->release_reason);
     g_free(w);
 }
 
 static gboolean
-watch_release_cb(gpointer user_data)
+bus_watch_changed_cb(gpointer user_data)
 {
-    Watch *w = user_data;
-    WatchReleaseFunc release = w->release;
-    gpointer release_data = w->user_data;
-    g_autofree char *reason = g_steal_pointer(&w->release_reason);
-    WatchRelease kind = w->release_kind;
+    BusWatch *w = user_data;
 
-    w->release_id = 0;
+    w->changed_id = 0;
     /* May free the watch: do not touch it afterwards */
-    release(reason, kind, release_data);
+    w->changed(w->user_data);
     return G_SOURCE_REMOVE;
+}
+
+static void
+bus_watch_trigger(BusWatch *w, guint delay_ms)
+{
+    if (!w->changed_id)
+        w->changed_id = g_timeout_add(delay_ms, bus_watch_changed_cb, w);
 }
 
 static gboolean
-watch_check_cb(gpointer user_data)
+bus_watch_reopen_cb(gpointer user_data)
 {
-    Watch *w = user_data;
-    g_autoptr(GError) error = NULL;
-    g_autofree char *current = NULL;
-    g_autoptr(JsonNode) prefs = NULL;
-    g_autoptr(JsonNode) status = NULL;
-    const char *reason = NULL;
-    const char *state;
+    BusWatch *w = user_data;
 
-    w->check_id = 0;
-
-    current = current_profile_id(w->api, &error);
-    if (!error)
-        prefs = localapi(w->api, "GET", "prefs", NULL, &error);
-    if (!error)
-        status = localapi(w->api, "GET", "status?peers=false", NULL, &error);
-
-    if (error) {
-        if (++w->failures < WATCH_MAX_FAILURES) {
-            g_debug("watch: %s, retrying", error->message);
-            w->check_id = g_timeout_add(WATCH_RETRY_MS, watch_check_cb, w);
-            return G_SOURCE_REMOVE;
-        }
-        reason = "tailscaled is unreachable";
-        w->release_kind = WATCH_RELEASE_FAILED;
-    } else {
-        w->failures = 0;
-        state = json_member_str(json_obj(status), "BackendState");
-        if (g_strcmp0(current, w->profile_id) != 0)
-            reason = "another Tailscale profile became active";
-        else if (!json_member_bool(json_obj(prefs), "WantRunning"))
-            reason = "Tailscale was stopped";
-        else if (g_strcmp0(state, "NeedsLogin") == 0 || g_strcmp0(state, "NeedsMachineAuth") == 0) {
-            reason = "the Tailscale profile needs to log in again";
-            w->release_kind = WATCH_RELEASE_LOGIN;
-        }
-    }
-
-    if (reason) {
-        watch_close_stream(w);
-        w->release_reason = g_strdup(reason);
-        w->release_id = g_idle_add(watch_release_cb, w);
-    } else if (!w->lines && !w->opening) {
-        watch_open(w);
-    }
+    w->reopen_id = 0;
+    bus_watch_open(w);
+    /* Things may have changed while the bus was closed */
+    bus_watch_trigger(w, 0);
     return G_SOURCE_REMOVE;
 }
 
 static void
-watch_schedule_check(Watch *w, guint delay_ms)
+bus_watch_lost(BusWatch *w, const GError *error)
 {
-    if (!w->check_id && !w->release_id)
-        w->check_id = g_timeout_add(delay_ms, watch_check_cb, w);
+    g_debug("watch: IPN bus unavailable%s%s", error ? ": " : "", error ? error->message : "");
+    bus_watch_close_stream(w);
+    if (!w->reopen_id)
+        w->reopen_id = g_timeout_add(WATCH_RETRY_MS, bus_watch_reopen_cb, w);
 }
 
 static void
-watch_line_cb(GObject *source, GAsyncResult *result, gpointer user_data)
+bus_watch_line_cb(GObject *source, GAsyncResult *result, gpointer user_data)
 {
     g_autoptr(GError) error = NULL;
     g_autofree char *line = g_data_input_stream_read_line_finish_utf8(G_DATA_INPUT_STREAM(source), result, NULL, &error);
-    Watch *w = user_data;
+    BusWatch *w = user_data;
 
     /* Cancelled means the watch may already be freed */
     if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
         return;
 
     if (!line) {
-        /* tailscaled closed the stream (restart?): check, which reopens it */
-        g_debug("watch: IPN bus closed%s%s", error ? ": " : "", error ? error->message : "");
-        g_clear_object(&w->lines);
-        watch_schedule_check(w, WATCH_RETRY_MS);
+        /* tailscaled closed the stream (restart?) */
+        bus_watch_lost(w, error);
         return;
     }
 
     /* State, profile and prefs changes all arrive as such messages */
     if (strstr(line, "\"State\"") || strstr(line, "\"Prefs\"") || strstr(line, "\"ErrMessage\""))
-        watch_schedule_check(w, WATCH_DEBOUNCE_MS);
+        bus_watch_trigger(w, WATCH_DEBOUNCE_MS);
 
-    g_data_input_stream_read_line_async(w->lines, G_PRIORITY_DEFAULT, w->cancellable, watch_line_cb, w);
+    g_data_input_stream_read_line_async(w->lines, G_PRIORITY_DEFAULT, w->cancellable, bus_watch_line_cb, w);
 }
 
 static void
-watch_opened_cb(GObject *source, GAsyncResult *result, gpointer user_data)
+bus_watch_opened_cb(GObject *source, GAsyncResult *result, gpointer user_data)
 {
     g_autoptr(GError) error = NULL;
     g_autoptr(GInputStream) body = soup_session_send_finish(SOUP_SESSION(source), result, &error);
-    Watch *w = user_data;
+    BusWatch *w = user_data;
 
     if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
         return;
 
-    w->opening = FALSE;
     if (body) {
         SoupMessage *msg = soup_session_get_async_result_message(SOUP_SESSION(source), result);
 
@@ -482,43 +429,92 @@ watch_opened_cb(GObject *source, GAsyncResult *result, gpointer user_data)
                         soup_message_get_status(msg));
     }
     if (error) {
-        g_debug("watch: cannot open IPN bus: %s", error->message);
-        watch_schedule_check(w, WATCH_RETRY_MS);
+        bus_watch_lost(w, error);
         return;
     }
 
     w->lines = g_data_input_stream_new(body);
-    g_data_input_stream_read_line_async(w->lines, G_PRIORITY_DEFAULT, w->cancellable, watch_line_cb, w);
+    g_data_input_stream_read_line_async(w->lines, G_PRIORITY_DEFAULT, w->cancellable, bus_watch_line_cb, w);
 }
 
 static void
-watch_open(Watch *w)
+bus_watch_open(BusWatch *w)
 {
     g_autoptr(SoupMessage) msg = soup_message_new("GET", LOCALAPI_URL "watch-ipn-bus?mask=0");
 
-    watch_close_stream(w);
+    bus_watch_close_stream(w);
     w->cancellable = g_cancellable_new();
-    w->opening = TRUE;
-    soup_session_send_async(w->stream, msg, G_PRIORITY_DEFAULT, w->cancellable, watch_opened_cb, w);
+    soup_session_send_async(w->stream, msg, G_PRIORITY_DEFAULT, w->cancellable, bus_watch_opened_cb, w);
 }
 
-static Watch *
-watch_new(SoupSession *api, const char *profile_id, WatchReleaseFunc release, gpointer user_data)
+/* Calls @changed once right away: something may have changed before the bus
+ * was open. */
+static BusWatch *
+bus_watch_new(BusWatchFunc changed, gpointer user_data)
 {
     const char *path = g_getenv(NM_TAILSCALE_SOCKET_ENV);
     g_autoptr(GSocketAddress) addr = g_unix_socket_address_new(path ? path : DEFAULT_SOCKET);
-    Watch *w = g_new0(Watch, 1);
+    BusWatch *w = g_new0(BusWatch, 1);
 
-    w->api = api;
     w->stream = soup_session_new_with_options("remote-connectable", addr, NULL);
-    w->profile_id = g_strdup(profile_id);
-    w->release = release;
+    w->changed = changed;
     w->user_data = user_data;
-
-    /* Check right away: something may have changed before the bus was open */
-    watch_open(w);
-    watch_schedule_check(w, 0);
+    bus_watch_open(w);
+    bus_watch_trigger(w, 0);
     return w;
+}
+
+/*****************************************************************************/
+/* Whether a connected profile still reflects tailscaled's state. A connection
+ * is released when another profile became active (another connection, or
+ * 'tailscale switch'), Tailscale was stopped ('tailscale down'), the profile
+ * needs to log in again, or tailscaled stays unreachable. */
+
+typedef enum {
+    PROFILE_CURRENT,
+    PROFILE_UNKNOWN,          /* tailscaled unreachable, for now */
+    PROFILE_RELEASE_EXPECTED, /* tailscaled moved on: a normal disconnect */
+    PROFILE_RELEASE_LOGIN,
+    PROFILE_RELEASE_FAILED,
+} ProfileVerdict;
+
+static ProfileVerdict
+check_profile(SoupSession *api, const char *profile_id, guint *failures, const char **reason)
+{
+    g_autoptr(GError) error = NULL;
+    g_autofree char *current = current_profile_id(api, &error);
+    g_autoptr(JsonNode) prefs = NULL;
+    g_autoptr(JsonNode) status = NULL;
+    const char *state;
+
+    if (!error)
+        prefs = localapi(api, "GET", "prefs", NULL, &error);
+    if (!error)
+        status = localapi(api, "GET", "status?peers=false", NULL, &error);
+
+    if (error) {
+        g_debug("watch: %s", error->message);
+        if (++*failures < WATCH_MAX_FAILURES)
+            return PROFILE_UNKNOWN;
+        *reason = "tailscaled is unreachable";
+        return PROFILE_RELEASE_FAILED;
+    }
+
+    *failures = 0;
+    state = json_member_str(json_obj(status), "BackendState");
+    if (g_strcmp0(current, profile_id) != 0) {
+        *reason = "another Tailscale profile became active";
+        return PROFILE_RELEASE_EXPECTED;
+    }
+    if (!json_member_bool(json_obj(prefs), "WantRunning")) {
+        *reason = "Tailscale was stopped";
+        return PROFILE_RELEASE_EXPECTED;
+    }
+    if (g_strcmp0(state, "NeedsLogin") == 0 || g_strcmp0(state, "NeedsMachineAuth") == 0) {
+        *reason = "the Tailscale profile needs to log in again";
+        return PROFILE_RELEASE_LOGIN;
+    }
+    return PROFILE_CURRENT;
 }
 
 /*****************************************************************************/
@@ -533,7 +529,8 @@ typedef struct {
     char *uuid; /* of the NetworkManager connection */
     guint poll_id;
     gint64 deadline;
-    Watch *watch;
+    BusWatch *watch;
+    guint watch_failures;
     gboolean released; /* tailscaled moved on: disconnect must leave it alone */
 } NMTailscalePlugin;
 
@@ -621,21 +618,26 @@ deactivate_through_nm(NMTailscalePlugin *self, GError **error)
 }
 
 static void
-on_watch_release(const char *reason, WatchRelease kind, gpointer user_data)
+on_tailscale_changed(gpointer user_data)
 {
     NMTailscalePlugin *self = user_data;
     NMVpnServicePlugin *plugin = NM_VPN_SERVICE_PLUGIN(self);
     g_autoptr(GError) error = NULL;
+    const char *reason = NULL;
+    ProfileVerdict verdict = check_profile(self->session, self->profile_id, &self->watch_failures, &reason);
+
+    if (verdict == PROFILE_CURRENT || verdict == PROFILE_UNKNOWN)
+        return;
 
     g_message("%s, disconnecting", reason);
     self->released = TRUE;
-    g_clear_pointer(&self->watch, watch_free);
+    g_clear_pointer(&self->watch, bus_watch_free);
 
-    if (kind == WATCH_RELEASE_EXPECTED) {
+    if (verdict == PROFILE_RELEASE_EXPECTED) {
         if (deactivate_through_nm(self, &error))
             return;
         g_warning("could not deactivate the connection through NetworkManager: %s", error->message);
-    } else if (kind == WATCH_RELEASE_LOGIN) {
+    } else if (verdict == PROFILE_RELEASE_LOGIN) {
         nm_vpn_service_plugin_failure(plugin, NM_VPN_PLUGIN_FAILURE_LOGIN_FAILED);
     }
     nm_vpn_service_plugin_disconnect(plugin, NULL);
@@ -656,7 +658,8 @@ poll_running(gpointer user_data)
         g_message("Tailscale is running, reporting %s to NetworkManager", self->interface);
         self->poll_id = 0;
         nm_vpn_service_plugin_set_config(plugin, config);
-        self->watch = watch_new(self->session, self->profile_id, on_watch_release, self);
+        self->watch_failures = 0;
+        self->watch = bus_watch_new(on_tailscale_changed, self);
         return G_SOURCE_REMOVE;
     }
 
@@ -697,7 +700,7 @@ real_connect(NMVpnServicePlugin *plugin, NMConnection *connection, GError **erro
     g_free(self->interface);
     self->interface = g_strdup(iface && *iface ? iface : DEFAULT_INTERFACE);
     self->released = FALSE;
-    g_clear_pointer(&self->watch, watch_free);
+    g_clear_pointer(&self->watch, bus_watch_free);
     g_free(self->uuid);
     self->uuid = g_strdup(nm_connection_get_uuid(connection));
 
@@ -728,7 +731,7 @@ real_disconnect(NMVpnServicePlugin *plugin, GError **error)
     GError *local = NULL;
 
     g_clear_handle_id(&self->poll_id, g_source_remove);
-    g_clear_pointer(&self->watch, watch_free);
+    g_clear_pointer(&self->watch, bus_watch_free);
 
     if (self->released || !self->profile_id)
         return TRUE;
@@ -758,7 +761,7 @@ nm_tailscale_plugin_dispose(GObject *object)
     NMTailscalePlugin *self = NM_TAILSCALE_PLUGIN(object);
 
     g_clear_handle_id(&self->poll_id, g_source_remove);
-    g_clear_pointer(&self->watch, watch_free);
+    g_clear_pointer(&self->watch, bus_watch_free);
     g_clear_object(&self->session);
     g_clear_pointer(&self->interface, g_free);
     g_clear_pointer(&self->profile_id, g_free);
@@ -779,15 +782,199 @@ nm_tailscale_plugin_class_init(NMTailscalePluginClass *klass)
 }
 
 /*****************************************************************************/
-/* Standalone test mode: exercises the LocalAPI path without NetworkManager. */
+/* Sync mode: a long-running service activating the NetworkManager connection
+ * of the profile tailscaled runs, when Tailscale was started outside
+ * NetworkManager ('tailscale up', 'tailscale switch', at boot). The plugin
+ * instances handle the opposite direction, so this never deactivates. */
+
+#define SYNC_FAILED_BACKOFF_S 30
+
+typedef struct {
+    SoupSession *api;
+    NMClient *nm;
+    BusWatch *watch;
+    gboolean activating;         /* activation requested, no reply yet */
+    NMActiveConnection *pending; /* our activation, until it settles */
+    char *pending_profile;
+    char *backoff_profile;       /* last activation failed for it... */
+    gint64 backoff_until;        /* ...so do not retry before */
+} Sync;
+
+static gboolean
+is_tailscale_connection(NMConnection *connection)
+{
+    NMSettingVpn *s_vpn = nm_connection_get_setting_vpn(connection);
+
+    return s_vpn && g_strcmp0(nm_setting_vpn_get_service_type(s_vpn), NM_DBUS_SERVICE_TAILSCALE) == 0;
+}
 
 static void
-test_watch_release(const char *reason, WatchRelease kind, gpointer user_data)
+sync_settle(Sync *s, gboolean failed)
 {
+    if (failed) {
+        g_free(s->backoff_profile);
+        s->backoff_profile = g_steal_pointer(&s->pending_profile);
+        s->backoff_until = g_get_monotonic_time() + SYNC_FAILED_BACKOFF_S * G_USEC_PER_SEC;
+    }
+    g_clear_pointer(&s->pending_profile, g_free);
+    if (s->pending) {
+        g_signal_handlers_disconnect_by_data(s->pending, s);
+        g_clear_object(&s->pending);
+    }
+    /* Tailscale may have moved on during the activation */
+    bus_watch_trigger(s->watch, 0);
+}
+
+static void
+sync_pending_state_cb(NMActiveConnection *ac, GParamSpec *pspec, gpointer user_data)
+{
+    Sync *s = user_data;
+    NMActiveConnectionState state = nm_active_connection_get_state(ac);
+
+    if (state == NM_ACTIVE_CONNECTION_STATE_ACTIVATED) {
+        sync_settle(s, FALSE);
+    } else if (state >= NM_ACTIVE_CONNECTION_STATE_DEACTIVATING) {
+        g_warning("sync: activating '%s' failed", nm_active_connection_get_id(ac));
+        sync_settle(s, TRUE);
+    }
+}
+
+static void
+sync_activated_cb(GObject *source, GAsyncResult *result, gpointer user_data)
+{
+    Sync *s = user_data;
+    g_autoptr(GError) error = NULL;
+    NMActiveConnection *ac = nm_client_activate_connection_finish(NM_CLIENT(source), result, &error);
+
+    s->activating = FALSE;
+    if (!ac) {
+        g_warning("sync: activation failed: %s", error->message);
+        sync_settle(s, TRUE);
+        return;
+    }
+
+    s->pending = ac;
+    g_signal_connect(ac, "notify::" NM_ACTIVE_CONNECTION_STATE, G_CALLBACK(sync_pending_state_cb), s);
+    sync_pending_state_cb(ac, NULL, s);
+}
+
+static void
+sync_changed(gpointer user_data)
+{
+    Sync *s = user_data;
+    g_autoptr(GError) error = NULL;
+    g_autofree char *current = NULL;
+    g_autoptr(JsonNode) prefs = NULL;
+    g_autoptr(JsonNode) status = NULL;
+    const GPtrArray *connections;
+    const GPtrArray *actives;
+    NMRemoteConnection *candidate = NULL;
+    const char *state;
+
+    if (s->activating || s->pending)
+        return; /* re-checked once it settles */
+
+    current = current_profile_id(s->api, &error);
+    if (!error)
+        prefs = localapi(s->api, "GET", "prefs", NULL, &error);
+    if (!error)
+        status = localapi(s->api, "GET", "status?peers=false", NULL, &error);
+    if (error) {
+        g_debug("sync: %s", error->message); /* the bus watch retries */
+        return;
+    }
+
+    state = json_member_str(json_obj(status), "BackendState");
+    if (!current || !json_member_bool(json_obj(prefs), "WantRunning")
+        || !(g_strcmp0(state, "Running") == 0 || g_strcmp0(state, "Starting") == 0))
+        return;
+
+    /* Leave any Tailscale connection being activated or already active alone:
+     * either it is this profile's, or its plugin is switching profiles */
+    actives = nm_client_get_active_connections(s->nm);
+    for (guint i = 0; i < actives->len; i++) {
+        NMActiveConnection *ac = actives->pdata[i];
+        NMRemoteConnection *rc = nm_active_connection_get_connection(ac);
+        NMActiveConnectionState ac_state = nm_active_connection_get_state(ac);
+
+        if (rc && is_tailscale_connection(NM_CONNECTION(rc))
+            && (ac_state == NM_ACTIVE_CONNECTION_STATE_ACTIVATING
+                || ac_state == NM_ACTIVE_CONNECTION_STATE_ACTIVATED))
+            return;
+    }
+
+    connections = nm_client_get_connections(s->nm);
+    for (guint i = 0; i < connections->len && !candidate; i++) {
+        NMConnection *c = connections->pdata[i];
+        const char *selector;
+        g_autofree char *id = NULL;
+
+        if (!is_tailscale_connection(c))
+            continue;
+        selector = nm_setting_vpn_get_data_item(nm_connection_get_setting_vpn(c), KEY_PROFILE);
+        id = selector ? resolve_profile_id(s->api, selector, NULL) : NULL;
+        if (g_strcmp0(id, current) == 0)
+            candidate = connections->pdata[i];
+    }
+
+    if (!candidate) {
+        g_debug("sync: no NetworkManager connection for Tailscale profile %s", current);
+        return;
+    }
+    if (g_strcmp0(s->backoff_profile, current) == 0 && g_get_monotonic_time() < s->backoff_until)
+        return;
+
+    g_message("sync: Tailscale runs profile %s, activating '%s'", current,
+              nm_connection_get_id(NM_CONNECTION(candidate)));
+    s->activating = TRUE;
+    s->pending_profile = g_strdup(current);
+    nm_client_activate_connection_async(s->nm, NM_CONNECTION(candidate), NULL, NULL, NULL, sync_activated_cb, s);
+}
+
+static int
+run_sync(void)
+{
+    g_autoptr(GError) error = NULL;
+    g_autoptr(GMainLoop) loop = g_main_loop_new(NULL, FALSE);
+    Sync s = {0};
+
+    s.nm = nm_client_new(NULL, &error);
+    if (!s.nm) {
+        g_warning("sync: cannot connect to NetworkManager: %s", error->message);
+        return 1;
+    }
+    s.api = localapi_session_new();
+    s.watch = bus_watch_new(sync_changed, &s);
+    g_message("sync: following tailscaled");
+    g_main_loop_run(loop);
+    return 0;
+}
+
+/*****************************************************************************/
+/* Standalone test mode: exercises the LocalAPI path without NetworkManager. */
+
+typedef struct {
+    SoupSession *api;
+    const char *profile_id;
+    guint failures;
+    GMainLoop *loop;
+} TestWatch;
+
+static void
+test_watch_changed(gpointer user_data)
+{
+    TestWatch *t = user_data;
+    const char *reason = NULL;
+    ProfileVerdict verdict = check_profile(t->api, t->profile_id, &t->failures, &reason);
+
+    if (verdict == PROFILE_CURRENT || verdict == PROFILE_UNKNOWN)
+        return;
     printf("would disconnect: %s (%s)\n", reason,
-           kind == WATCH_RELEASE_EXPECTED ? "deactivate" : kind == WATCH_RELEASE_LOGIN ? "login failure" : "failure");
+           verdict == PROFILE_RELEASE_EXPECTED ? "deactivate"
+           : verdict == PROFILE_RELEASE_LOGIN  ? "login failure"
+                                               : "failure");
     fflush(stdout);
-    g_main_loop_quit(user_data);
+    g_main_loop_quit(t->loop);
 }
 
 static int
@@ -811,12 +998,13 @@ run_test(const char *profile, gboolean down, gboolean watch)
 
     if (watch) {
         g_autoptr(GMainLoop) loop = g_main_loop_new(NULL, FALSE);
-        Watch *w = watch_new(session, id, test_watch_release, loop);
+        TestWatch t = {.api = session, .profile_id = id, .loop = loop};
+        BusWatch *w = bus_watch_new(test_watch_changed, &t);
 
         printf("watching profile %s\n", id);
         fflush(stdout);
         g_main_loop_run(loop);
-        watch_free(w);
+        bus_watch_free(w);
         return 0;
     }
 
@@ -873,6 +1061,7 @@ main(int argc, char *argv[])
     gboolean persist = FALSE;
     gboolean debug = FALSE;
     gboolean test_down = FALSE;
+    gboolean sync = FALSE;
     GOptionEntry entries[] = {
         {"persist", 0, 0, G_OPTION_ARG_NONE, &persist, "Don't quit when the VPN connection terminates", NULL},
         {"debug", 0, 0, G_OPTION_ARG_NONE, &debug, "Enable verbose debug logging", NULL},
@@ -882,6 +1071,8 @@ main(int argc, char *argv[])
         {"test-down", 0, 0, G_OPTION_ARG_NONE, &test_down, "Bring Tailscale down without NetworkManager", NULL},
         {"test-watch", 0, 0, G_OPTION_ARG_STRING, &test_watch, "Watch tailscaled as a connection to PROFILE would, "
                                                                "and report when it would disconnect", "PROFILE"},
+        {"sync", 0, 0, G_OPTION_ARG_NONE, &sync, "Run as a service activating the NetworkManager connection of the "
+                                                  "profile Tailscale runs, when started outside NetworkManager", NULL},
         {NULL},
     };
 
@@ -896,6 +1087,8 @@ main(int argc, char *argv[])
     if (debug)
         g_setenv("G_MESSAGES_DEBUG", "all", TRUE);
 
+    if (sync)
+        return run_sync();
     if (test_watch)
         return run_test(test_watch, FALSE, TRUE);
     if (test_profile || test_down)

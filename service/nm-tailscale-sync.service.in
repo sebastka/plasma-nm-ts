@@ -1,0 +1,12 @@
+[Unit]
+Description=Activate the NetworkManager connection of the running Tailscale profile
+Documentation=https://github.com/sebastka/plasma-nm-ts
+After=NetworkManager.service tailscaled.service
+
+[Service]
+ExecStart=@CMAKE_INSTALL_FULL_LIBEXECDIR@/nm-tailscale-service --sync
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
