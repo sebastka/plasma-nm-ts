@@ -29,5 +29,8 @@ in
     ];
 
     networking.networkmanager.plugins = [ cfg.package ];
+
+    # NetworkManager only discovers VPN plugins at startup
+    systemd.services.NetworkManager.restartTriggers = [ cfg.package ];
   };
 }

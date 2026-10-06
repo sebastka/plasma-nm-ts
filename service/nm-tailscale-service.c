@@ -212,7 +212,12 @@ G_DEFINE_AUTO_CLEANUP_CLEAR_FUNC(VpnConfig, vpn_config_clear)
 
 /* Builds the configuration NetworkManager expects from a LocalAPI status
  * object. Only the tailnet addresses are reported: no routes, no DNS and
- * never-default, so NetworkManager does not compete with tailscaled. */
+ * never-default, so NetworkManager does not compete with tailscaled.
+ *
+ * NetworkManager rejects a config without an external gateway and adds a host
+ * route to it via the parent device. Tailscale has no single gateway, so the
+ * node's own tailnet address is reported: any such route is shadowed by the
+ * local routing table and never used. */
 static gboolean
 build_vpn_config(JsonObject *status, const char *iface, VpnConfig *out, GError **error)
 {
@@ -220,6 +225,7 @@ build_vpn_config(JsonObject *status, const char *iface, VpnConfig *out, GError *
                              ? json_object_get_member(status, "TailscaleIPs")
                              : NULL;
     JsonArray *ips = ips_node && JSON_NODE_HOLDS_ARRAY(ips_node) ? json_node_get_array(ips_node) : NULL;
+    GVariant *gateway = NULL;
     GVariantBuilder config;
 
     if (if_nametoindex(iface) == 0) {
@@ -243,6 +249,8 @@ build_vpn_config(JsonObject *status, const char *iface, VpnConfig *out, GError *
             g_variant_builder_add(&b, "{sv}", NM_VPN_PLUGIN_IP4_CONFIG_PREFIX, g_variant_new_uint32(32));
             g_variant_builder_add(&b, "{sv}", NM_VPN_PLUGIN_IP4_CONFIG_NEVER_DEFAULT, g_variant_new_boolean(TRUE));
             out->ip4 = g_variant_ref_sink(g_variant_builder_end(&b));
+            g_clear_pointer(&gateway, g_variant_unref);
+            gateway = g_variant_ref_sink(g_variant_new_uint32(a4.s_addr));
         } else if (!out->ip6 && inet_pton(AF_INET6, ip, &a6) == 1) {
             g_variant_builder_init(&b, G_VARIANT_TYPE_VARDICT);
             g_variant_builder_add(&b, "{sv}", NM_VPN_PLUGIN_IP6_CONFIG_ADDRESS,
@@ -250,6 +258,8 @@ build_vpn_config(JsonObject *status, const char *iface, VpnConfig *out, GError *
             g_variant_builder_add(&b, "{sv}", NM_VPN_PLUGIN_IP6_CONFIG_PREFIX, g_variant_new_uint32(128));
             g_variant_builder_add(&b, "{sv}", NM_VPN_PLUGIN_IP6_CONFIG_NEVER_DEFAULT, g_variant_new_boolean(TRUE));
             out->ip6 = g_variant_ref_sink(g_variant_builder_end(&b));
+            if (!gateway)
+                gateway = g_variant_ref_sink(g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, &a6, sizeof(a6), 1));
         }
     }
 
@@ -260,6 +270,10 @@ build_vpn_config(JsonObject *status, const char *iface, VpnConfig *out, GError *
 
     g_variant_builder_init(&config, G_VARIANT_TYPE_VARDICT);
     g_variant_builder_add(&config, "{sv}", NM_VPN_PLUGIN_CONFIG_TUNDEV, g_variant_new_string(iface));
+    g_variant_builder_add(&config, "{sv}", NM_VPN_PLUGIN_CONFIG_EXT_GATEWAY, gateway);
+    g_variant_unref(gateway);
+    /* tailscaled survives link changes on its own, so vpn.persistent is safe */
+    g_variant_builder_add(&config, "{sv}", NM_VPN_PLUGIN_CAN_PERSIST, g_variant_new_boolean(TRUE));
     g_variant_builder_add(&config, "{sv}", NM_VPN_PLUGIN_CONFIG_HAS_IP4, g_variant_new_boolean(out->ip4 != NULL));
     g_variant_builder_add(&config, "{sv}", NM_VPN_PLUGIN_CONFIG_HAS_IP6, g_variant_new_boolean(out->ip6 != NULL));
     out->config = g_variant_ref_sink(g_variant_builder_end(&config));

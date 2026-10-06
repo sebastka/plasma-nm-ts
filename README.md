@@ -1,5 +1,8 @@
 # plasma-nm-ts
 
+> [!NOTE]
+> This project was created with [Anthropic Claude Opus 5.5](https://www.anthropic.com/claude).
+
 Tailscale profiles as NetworkManager VPN connections, so they show up in the
 KDE Plasma network applet (plasma-nm), one connection per Tailscale profile.
 
