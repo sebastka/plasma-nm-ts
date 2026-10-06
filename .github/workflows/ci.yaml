@@ -21,8 +21,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {name: "Fedora 44", image: "fedora:44"}
-          - {name: "Debian 13", image: "debian:trixie"}
+          - {name: "Fedora stable", image: "fedora:latest"}
+          - {name: "Debian stable", image: "debian:stable"}
+          - {name: "Ubuntu LTS", image: "ubuntu:latest"}  # latest is the newest LTS
     runs-on: ubuntu-latest
     container: ${{ matrix.image }}
     steps:
@@ -33,8 +34,8 @@ jobs:
           glib2-devel json-glib-devel libsoup3-devel NetworkManager-libnm-devel
           extra-cmake-modules qt6-qtbase-devel kf6-kcoreaddons-devel kf6-ki18n-devel
           kf6-kwidgetsaddons-devel kf6-networkmanager-qt-devel plasma-nm
-      - name: Install build dependencies (Debian)
-        if: startsWith(matrix.image, 'debian')
+      - name: Install build dependencies (Debian, Ubuntu)
+        if: startsWith(matrix.image, 'debian') || startsWith(matrix.image, 'ubuntu')
         run: |
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \

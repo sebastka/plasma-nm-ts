@@ -87,9 +87,18 @@ journalctl -u nm-tailscale-sync -f
 
 ## Releases
 
-GitHub releases carry `.deb` packages for Debian 13 and `.rpm` packages for
-Fedora 44, for x86_64 and aarch64. The plasma-nm plugin is built against that
-distribution's plasma-nm, so the packages only fit those distributions.
+GitHub releases carry `.deb` packages for the current Debian stable and Ubuntu
+LTS (Kubuntu) releases, and `.rpm` packages for the current Fedora release, for
+x86_64 and aarch64. The plasma-nm plugin is built against that release's
+plasma-nm, so each package only fits the release named in its file name.
+Releases still on Plasma 5 are not supported.
+
+Every published file has a signed build provenance attestation. To check that
+a package was built by this repository's Release workflow:
+
+```sh
+gh attestation verify FILE -R sebastka/plasma-nm-ts
+```
 
 To release: bump the version everywhere `scripts/check-version.sh` looks (and
 add a `%changelog` entry to `packaging/plasma-nm-ts.spec`) in a pull request,
@@ -100,8 +109,9 @@ release. Its `dry_run` option stops before tagging.
 Packages can also be built locally in a container:
 
 ```sh
-docker run --rm -v "$PWD:/src" -w /src debian:trixie packaging/build-deb.sh
-docker run --rm -v "$PWD:/src" -w /src fedora:44 packaging/build-rpm.sh
+docker run --rm -v "$PWD:/src" -w /src debian:stable packaging/build-deb.sh
+docker run --rm -v "$PWD:/src" -w /src ubuntu:latest packaging/build-deb.sh
+docker run --rm -v "$PWD:/src" -w /src fedora:latest packaging/build-rpm.sh
 ```
 
 ## License

@@ -2,7 +2,7 @@
 # Build the RPM for the Fedora release and architecture it runs on. Meant for
 # a clean container:
 #
-#   docker run --rm -v "$PWD:/src" -w /src fedora:44 packaging/build-rpm.sh
+#   docker run --rm -v "$PWD:/src" -w /src fedora:latest packaging/build-rpm.sh
 #
 # Installs the build dependencies (needs root), fetches the source of the
 # installed plasma-nm (checksum verified), and builds from the working tree.

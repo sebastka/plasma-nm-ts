@@ -1,8 +1,9 @@
 #!/bin/sh
-# Build the .deb for the Debian release and architecture it runs on. Meant for
-# a clean container:
+# Build the .deb for the Debian or Ubuntu release and architecture it runs on.
+# Meant for a clean container:
 #
-#   docker run --rm -v "$PWD:/src" -w /src debian:trixie packaging/build-deb.sh
+#   docker run --rm -v "$PWD:/src" -w /src debian:stable packaging/build-deb.sh
+#   docker run --rm -v "$PWD:/src" -w /src ubuntu:latest packaging/build-deb.sh
 #
 # Installs the build dependencies (needs root), fetches the source of the
 # installed plasma-nm (checksum verified), builds with CMake, and packages the
@@ -14,6 +15,10 @@ cd "$top"
 version=$(scripts/check-version.sh)
 revision=${DEB_REVISION:-1}
 arch=$(dpkg --print-architecture)
+# Each package only fits the release it was built on (plasma-nm's private
+# ABI): its ID and VERSION_ID (e.g. debian13) go in the version and file name
+# shellcheck source=/dev/null
+distro=$(. /etc/os-release && echo "$ID$VERSION_ID")
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -25,7 +30,7 @@ apt-get install -y -qq --no-install-recommends \
 
 work=$(mktemp -d)
 scripts/fetch-plasma-nm-source.sh "$work/plasma-nm"
-# 4:6.3.6-1 -> 4:6.3.6: any later plasma-nm, including Debian revisions
+# 4:6.3.6-1 -> 4:6.3.6: any later plasma-nm, including distribution revisions
 plasma_nm_version=$(dpkg-query -W -f '${Version}' plasma-nm | sed 's/-[^-]*$//')
 
 build="$work/build"
@@ -55,7 +60,7 @@ fi
 mkdir -p "$stage/DEBIAN"
 cat > "$stage/DEBIAN/control" <<EOF
 Package: plasma-nm-ts
-Version: $version-$revision
+Version: $version-$revision~$distro
 Architecture: $arch
 Maintainer: Sebastian Karlsen <sebastian@karlsen.fr>
 Installed-Size: $(du -sk "$stage" | cut -f1)
@@ -99,7 +104,7 @@ EOF
 chmod 755 "$stage/DEBIAN/postinst" "$stage/DEBIAN/prerm" "$stage/DEBIAN/postrm"
 
 mkdir -p packaging/out
-deb="packaging/out/plasma-nm-ts_${version}-${revision}_${arch}.deb"
+deb="packaging/out/plasma-nm-ts_${version}-${revision}_${distro}_${arch}.deb"
 dpkg-deb --root-owner-group --build "$stage" "$deb" >/dev/null
 rm -rf "$work"
 dpkg-deb --info "$deb" | sed -n 's/^ \(Depends\|Recommends\):/\1:/p'

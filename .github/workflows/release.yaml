@@ -2,9 +2,9 @@
 name: Release
 
 # Run manually with a version to release it: after validating the commit, it
-# builds the .deb (Debian 13) and .rpm (Fedora 44) for x86_64 and aarch64, and
-# only then tags vX.Y.Z and publishes the GitHub release. A failed build leaves
-# no tag behind.
+# builds the .deb (Debian stable, Ubuntu LTS) and .rpm (Fedora stable) for x86_64 and
+# aarch64, attests their provenance, and only then tags vX.Y.Z and publishes the
+# GitHub release. A failed build leaves no tag behind.
 #
 # Nothing here commits. Bump the version in a normal pull request first
 # (scripts/check-version.sh lists where it is declared); this workflow only
@@ -103,26 +103,29 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   deb:
-    name: 'release: deb (Debian 13, ${{ matrix.arch }})'
+    name: 'release: deb (${{ matrix.distro.name }}, ${{ matrix.arch.name }})'
     needs: validate
     strategy:
       matrix:
-        include:
-          - {arch: amd64, runner: ubuntu-latest}
-          - {arch: arm64, runner: ubuntu-24.04-arm}
-    runs-on: ${{ matrix.runner }}
-    container: debian:trixie
+        distro:
+          - {name: Debian stable, image: 'debian:stable', id: debian}
+          - {name: Ubuntu LTS, image: 'ubuntu:latest', id: ubuntu}  # latest is the newest LTS
+        arch:
+          - {name: amd64, runner: ubuntu-latest}
+          - {name: arm64, runner: ubuntu-24.04-arm}
+    runs-on: ${{ matrix.arch.runner }}
+    container: ${{ matrix.distro.image }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - run: packaging/build-deb.sh
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: deb-${{ matrix.arch }}
+          name: deb-${{ matrix.distro.id }}-${{ matrix.arch.name }}
           path: packaging/out/*.deb
           if-no-files-found: error
 
   rpm:
-    name: 'release: rpm (Fedora 44, ${{ matrix.arch }})'
+    name: 'release: rpm (Fedora stable, ${{ matrix.arch }})'
     needs: validate
     strategy:
       matrix:
@@ -130,7 +133,7 @@ jobs:
           - {arch: x86_64, runner: ubuntu-latest}
           - {arch: aarch64, runner: ubuntu-24.04-arm}
     runs-on: ${{ matrix.runner }}
-    container: fedora:44
+    container: fedora:latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - run: packaging/build-rpm.sh
@@ -148,6 +151,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write      # attestations: Sigstore signing identity
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
@@ -160,6 +165,14 @@ jobs:
           find . -mindepth 2 -type f \( -name '*.rpm' -o -name '*.deb' \) -exec mv {} . \;
           sha256sum -- *.rpm *.deb > SHA256SUMS
           cat SHA256SUMS
+      # Signed build provenance for every published file, verifiable with
+      # gh attestation verify FILE -R sebastka/plasma-nm-ts
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: |
+            dist/*.rpm
+            dist/*.deb
+            dist/SHA256SUMS
       # Only now that every package built: a failed build leaves no tag
       - name: Tag the release
         run: |
