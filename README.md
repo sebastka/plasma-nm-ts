@@ -82,4 +82,9 @@ cmake -B build -DBUILD_PLASMA_NM_PLUGIN=OFF
 
 # Plugin logs
 journalctl -u NetworkManager -f
+journalctl -u nm-tailscale-sync -f
 ```
+
+## License
+
+GPL-2.0-or-later, like plasma-nm. See [LICENSE](LICENSE).
