@@ -11,6 +11,7 @@
 #include <NetworkManager.h>
 #include <arpa/inet.h>
 #include <gio/gunixsocketaddress.h>
+#include <ifaddrs.h>
 #include <json-glib/json-glib.h>
 #include <libsoup/soup.h>
 #include <net/if.h>
@@ -193,6 +194,26 @@ tailscale_down(SoupSession *session, GError **error)
 /*****************************************************************************/
 /* NetworkManager configuration */
 
+static gboolean
+iface_has_address(const char *iface, int family, const void *addr)
+{
+    struct ifaddrs *ifas, *ifa;
+    gboolean found = FALSE;
+
+    if (getifaddrs(&ifas) != 0)
+        return FALSE;
+    for (ifa = ifas; ifa && !found; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != family || g_strcmp0(ifa->ifa_name, iface) != 0)
+            continue;
+        if (family == AF_INET)
+            found = memcmp(&((struct sockaddr_in *) ifa->ifa_addr)->sin_addr, addr, sizeof(struct in_addr)) == 0;
+        else
+            found = memcmp(&((struct sockaddr_in6 *) ifa->ifa_addr)->sin6_addr, addr, sizeof(struct in6_addr)) == 0;
+    }
+    freeifaddrs(ifas);
+    return found;
+}
+
 /* Builds the configuration NetworkManager expects from a LocalAPI status
  * object.
  *
@@ -222,22 +243,36 @@ build_vpn_config(JsonObject *status, const char *iface, GError **error)
         return NULL;
     }
 
-    /* Prefer the IPv4 address as gateway */
+    /* "Running" is not enough: if tailscaled failed to configure the interface
+     * (its router state can get out of sync with the kernel), nothing works.
+     * Prefer the IPv4 address as gateway. */
     for (guint i = 0; ips && i < json_array_get_length(ips); i++) {
         JsonNode *n = json_array_get_element(ips, i);
         const char *ip = JSON_NODE_HOLDS_VALUE(n) ? json_node_get_string(n) : NULL;
         struct in_addr a4;
         struct in6_addr a6;
+        gboolean is4;
 
         if (!ip)
             continue;
-        if (inet_pton(AF_INET, ip, &a4) == 1) {
+        is4 = inet_pton(AF_INET, ip, &a4) == 1;
+        if (!is4 && inet_pton(AF_INET6, ip, &a6) != 1)
+            continue;
+
+        if (!iface_has_address(iface, is4 ? AF_INET : AF_INET6, is4 ? (void *) &a4 : (void *) &a6)) {
+            g_clear_pointer(&gateway, g_variant_unref);
+            g_set_error(error, NM_VPN_PLUGIN_ERROR, NM_VPN_PLUGIN_ERROR_FAILED,
+                        "tailscaled reports %s but it is not assigned to %s (restarting tailscaled may help)", ip,
+                        iface);
+            return NULL;
+        }
+
+        if (is4 && (!gateway || g_variant_is_of_type(gateway, G_VARIANT_TYPE_BYTESTRING))) {
             g_clear_pointer(&gateway, g_variant_unref);
             gateway = g_variant_ref_sink(g_variant_new_uint32(a4.s_addr));
-            break;
-        }
-        if (!gateway && inet_pton(AF_INET6, ip, &a6) == 1)
+        } else if (!is4 && !gateway) {
             gateway = g_variant_ref_sink(g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, &a6, sizeof(a6), 1));
+        }
     }
 
     if (!gateway) {
