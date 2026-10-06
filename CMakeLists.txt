@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(plasma-nm-ts VERSION 0.1.1 LANGUAGES C CXX)
+project(plasma-nm-ts VERSION 0.1.2 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 find_package(PkgConfig REQUIRED)

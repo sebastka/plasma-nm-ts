@@ -93,11 +93,25 @@ x86_64 and aarch64. The plasma-nm plugin is built against that release's
 plasma-nm, so each package only fits the release named in its file name.
 Releases still on Plasma 5 are not supported.
 
-Every published file has a signed build provenance attestation. To check that
-a package was built by this repository's Release workflow:
+Every published file has a signed build provenance attestation (SLSA
+provenance, signed through Sigstore). To check that a package was built by this
+repository's Release workflow:
 
 ```sh
 gh attestation verify FILE -R sebastka/plasma-nm-ts
+```
+
+The attestation is also published with each release as
+`plasma-nm-ts-VERSION.sigstore.json`, for verifying with the file only
+(`gh attestation verify FILE --bundle BUNDLE -R sebastka/plasma-nm-ts`) or
+with cosign:
+
+```sh
+cosign verify-blob-attestation --bundle BUNDLE --new-bundle-format \
+  --type slsaprovenance1 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/sebastka/plasma-nm-ts/\.github/workflows/release\.yaml@' \
+  FILE
 ```
 
 To release: bump the version everywhere `scripts/check-version.sh` looks (and

@@ -166,13 +166,20 @@ jobs:
           sha256sum -- *.rpm *.deb > SHA256SUMS
           cat SHA256SUMS
       # Signed build provenance for every published file, verifiable with
-      # gh attestation verify FILE -R sebastka/plasma-nm-ts
+      # gh attestation verify FILE -R sebastka/plasma-nm-ts. One attestation
+      # covers all files; its Sigstore bundle is also published, for cosign.
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        id: attest
         with:
           subject-path: |
             dist/*.rpm
             dist/*.deb
             dist/SHA256SUMS
+      - name: Add the attestation bundle
+        run: cp "$BUNDLE" "dist/plasma-nm-ts-$VERSION.sigstore.json"
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          VERSION: ${{ needs.validate.outputs.version }}
       # Only now that every package built: a failed build leaves no tag
       - name: Tag the release
         run: |
@@ -189,4 +196,5 @@ jobs:
             dist/*.rpm
             dist/*.deb
             dist/SHA256SUMS
+            dist/*.sigstore.json
           generate_release_notes: true

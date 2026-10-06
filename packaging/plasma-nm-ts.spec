@@ -5,7 +5,7 @@
 %{!?plasma_nm_version:%global plasma_nm_version 0}
 
 Name:           plasma-nm-ts
-Version:        0.1.1
+Version:        0.1.2
 Release:        1%{?dist}
 Summary:        Tailscale profiles as NetworkManager VPN connections in KDE Plasma
 License:        GPL-2.0-or-later
@@ -79,6 +79,9 @@ fi
 %{_qt6_plugindir}/plasma/network/vpn/plasmanetworkmanagement_tailscaleui.so
 
 %changelog
+* Wed Oct 07 2026 Sebastian Karlsen <sebastian@karlsen.fr> - 0.1.2-1
+- Attestation bundle published with each release
+
 * Wed Oct 07 2026 Sebastian Karlsen <sebastian@karlsen.fr> - 0.1.1-1
 - Packages for Ubuntu LTS; build provenance attestations
 
