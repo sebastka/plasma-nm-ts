@@ -16,7 +16,25 @@ else
     exit 1
 fi
 
+tarball="plasma-nm-$version.tar.xz"
+url="https://download.kde.org/stable/plasma/$version/$tarball"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+# The tarball is redirected to third-party mirrors; its checksum is served by
+# download.kde.org itself, so it is the trust anchor. Refuse it from elsewhere.
+checksum_url=$(curl -fsSL --proto '=https' -o "$tmp/$tarball.sha256" -w '%{url_effective}' "$url.sha256")
+case "$checksum_url" in
+    https://download.kde.org/*) ;;
+    *)
+        echo "$0: checksum served from $checksum_url, expected download.kde.org" >&2
+        exit 1
+        ;;
+esac
+
+curl -fsSL --proto '=https' -o "$tmp/$tarball" "$url"
+(cd "$tmp" && sha256sum -c --quiet "$tarball.sha256")
+
 mkdir -p "$dest"
-curl -fsSL "https://download.kde.org/stable/plasma/$version/plasma-nm-$version.tar.xz" \
-    | tar -xJ -C "$dest" --strip-components=1
-echo "plasma-nm $version source in $dest"
+tar -xJ -f "$tmp/$tarball" -C "$dest" --strip-components=1
+echo "plasma-nm $version source in $dest (sha256 verified)"
