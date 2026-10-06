@@ -18,6 +18,14 @@ in
       defaultText = lib.literalExpression "pkgs.kdePackages.callPackage ./package.nix { }";
       description = "The plasma-nm-ts package to use.";
     };
+    sync = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Run a service activating the NetworkManager connection of the profile Tailscale runs, when Tailscale
+        was started outside NetworkManager (`tailscale up`, `tailscale switch`, at boot).
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -35,5 +43,10 @@ in
 
     # The plasma-nm plugin is found through /run/current-system/sw/lib/qt-6/plugins
     environment.systemPackages = [ cfg.package ];
+
+    systemd.packages = lib.mkIf cfg.sync [ cfg.package ];
+    systemd.services.nm-tailscale-sync = lib.mkIf cfg.sync {
+      wantedBy = [ "multi-user.target" ];
+    };
   };
 }

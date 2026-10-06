@@ -15,3 +15,6 @@ install(TARGETS nm-tailscale-service DESTINATION ${CMAKE_INSTALL_LIBEXECDIR})
 configure_file(nm-tailscale-service.name.in nm-tailscale-service.name @ONLY)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/nm-tailscale-service.name DESTINATION lib/NetworkManager/VPN)
 install(FILES nm-tailscale-service.conf DESTINATION ${CMAKE_INSTALL_DATADIR}/dbus-1/system.d)
+
+configure_file(nm-tailscale-sync.service.in nm-tailscale-sync.service @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/nm-tailscale-sync.service DESTINATION lib/systemd/system)

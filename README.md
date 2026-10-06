@@ -60,6 +60,11 @@ itself without stopping Tailscale. Changes made outside NetworkManager
 (`tailscale down`, `tailscale switch`, an expired login) also disconnect the
 connection in NetworkManager.
 
+The `nm-tailscale-sync` service covers the other direction: when Tailscale
+runs a profile whose connection is not active (`tailscale up`,
+`tailscale switch`, at boot), it activates that connection. The NixOS module
+enables it; set `services.plasma-nm-ts.sync = false` to disable it.
+
 ## Development
 
 ```sh
