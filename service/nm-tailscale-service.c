@@ -17,14 +17,12 @@
 #include <stdio.h>
 #include <string.h>
 
-#define NM_DBUS_SERVICE_TAILSCALE "org.freedesktop.NetworkManager.tailscale"
+#include "nm-tailscale.h"
 
-/* vpn.data keys */
-#define KEY_PROFILE   "profile"   /* profile ID, name, login name or tailnet */
-#define KEY_INTERFACE "interface" /* defaults to DEFAULT_INTERFACE */
-
-#define DEFAULT_SOCKET    "/var/run/tailscale/tailscaled.sock"
-#define DEFAULT_INTERFACE "tailscale0"
+#define KEY_PROFILE       NM_TAILSCALE_KEY_PROFILE
+#define KEY_INTERFACE     NM_TAILSCALE_KEY_INTERFACE
+#define DEFAULT_SOCKET    NM_TAILSCALE_DEFAULT_SOCKET
+#define DEFAULT_INTERFACE NM_TAILSCALE_DEFAULT_INTERFACE
 #define LOCALAPI_URL      "http://local-tailscaled.sock/localapi/v0/"
 
 #define POLL_INTERVAL_MS   500
@@ -36,7 +34,7 @@
 static SoupSession *
 localapi_session_new(void)
 {
-    const char *path = g_getenv("TAILSCALED_SOCKET");
+    const char *path = g_getenv(NM_TAILSCALE_SOCKET_ENV);
     g_autoptr(GSocketAddress) addr = g_unix_socket_address_new(path ? path : DEFAULT_SOCKET);
 
     return soup_session_new_with_options("remote-connectable", addr, "timeout", 15, NULL);

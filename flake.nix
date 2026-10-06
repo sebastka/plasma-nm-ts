@@ -14,7 +14,7 @@
     in
     {
       packages = forAllSystems (pkgs: rec {
-        plasma-nm-ts = pkgs.callPackage ./nix/package.nix { };
+        plasma-nm-ts = pkgs.kdePackages.callPackage ./nix/package.nix { };
         default = plasma-nm-ts;
       });
 
@@ -24,6 +24,6 @@
         };
       });
 
-      nixosModules.default = import ./nix/module.nix self;
+      nixosModules.default = import ./nix/module.nix;
     };
 }

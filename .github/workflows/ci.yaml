@@ -29,17 +29,24 @@ jobs:
       - name: Install build dependencies (Fedora)
         if: startsWith(matrix.image, 'fedora')
         run: >
-          dnf -y -q install git cmake ninja-build gcc pkgconf-pkg-config
+          dnf -y -q install git curl xz cmake ninja-build gcc gcc-c++ pkgconf-pkg-config
           glib2-devel json-glib-devel libsoup3-devel NetworkManager-libnm-devel
+          extra-cmake-modules qt6-qtbase-devel kf6-kcoreaddons-devel kf6-ki18n-devel
+          kf6-kwidgetsaddons-devel kf6-networkmanager-qt-devel plasma-nm
       - name: Install build dependencies (Debian)
         if: startsWith(matrix.image, 'debian')
         run: |
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-            git ca-certificates build-essential cmake ninja-build pkg-config \
-            libglib2.0-dev libjson-glib-dev libsoup-3.0-dev libnm-dev
+            git curl xz-utils ca-certificates build-essential cmake ninja-build pkg-config \
+            libglib2.0-dev libjson-glib-dev libsoup-3.0-dev libnm-dev \
+            extra-cmake-modules qt6-base-dev libkf6coreaddons-dev libkf6i18n-dev \
+            libkf6widgetsaddons-dev libkf6networkmanagerqt-dev plasma-nm
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+      - run: scripts/fetch-plasma-nm-source.sh "$RUNNER_TEMP/plasma-nm"
+      - run: >
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+          -DPLASMA_NM_SOURCE_DIR="$RUNNER_TEMP/plasma-nm"
       - run: cmake --build build
       - run: DESTDIR="$PWD/stage" cmake --install build
 

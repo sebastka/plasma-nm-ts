@@ -1,0 +1,18 @@
+{
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "Sebastian Karlsen"
+            }
+        ],
+        "Category": "VPNService",
+        "Description": "Tailscale accounts, managed by tailscaled",
+        "EnabledByDefault": false,
+        "Icon": "",
+        "License": "GPL",
+        "Name": "Tailscale",
+        "Version": "0.1",
+        "Website": "https://github.com/sebastka/plasma-nm-ts"
+    },
+    "X-NetworkManager-Services": "org.freedesktop.NetworkManager.tailscale"
+}
