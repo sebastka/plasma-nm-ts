@@ -10,6 +10,7 @@
 #include <QDBusMetaType>
 #include <QFormLayout>
 #include <QLabel>
+#include <QSignalBlocker>
 
 TailscaleWidget::TailscaleWidget(const NetworkManager::VpnSetting::Ptr &setting, QWidget *parent)
     : SettingWidget(setting, parent)
@@ -47,6 +48,10 @@ void TailscaleWidget::loadConfig(const NetworkManager::Setting::Ptr &setting)
 {
     Q_UNUSED(setting)
 
+    // Programmatic changes must not mark the connection as modified
+    // (watchChangedSetting() treats any combo box change as an edit)
+    const QSignalBlocker blocker(m_profile);
+
     m_selector = m_setting->data().value(QStringLiteral(NM_TAILSCALE_KEY_PROFILE));
     if (!m_selector.isEmpty() && m_profile->count() == 0) {
         // Until tailscaled answers, show what is stored
@@ -57,6 +62,7 @@ void TailscaleWidget::loadConfig(const NetworkManager::Setting::Ptr &setting)
 
 void TailscaleWidget::populate(const QList<TailscaleProfile> &profiles)
 {
+    const QSignalBlocker blocker(m_profile);
     int selected = -1;
 
     m_profile->clear();
