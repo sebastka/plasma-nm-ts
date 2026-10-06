@@ -1,0 +1,13 @@
+# Weekly GitHub Actions updates, grouped so they arrive as one PR.
+# C/CMake dependencies come from the distro or nixpkgs (see update-flake-lock.yaml).
+---
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

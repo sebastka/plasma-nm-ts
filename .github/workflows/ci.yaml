@@ -1,0 +1,59 @@
+---
+name: CI
+
+'on':
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: "Fedora 44", image: "fedora:44"}
+          - {name: "Debian 13", image: "debian:trixie"}
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    steps:
+      - name: Install build dependencies (Fedora)
+        if: startsWith(matrix.image, 'fedora')
+        run: >
+          dnf -y -q install git cmake ninja-build gcc pkgconf-pkg-config
+          glib2-devel json-glib-devel libsoup3-devel NetworkManager-libnm-devel
+      - name: Install build dependencies (Debian)
+        if: startsWith(matrix.image, 'debian')
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            git ca-certificates build-essential cmake ninja-build pkg-config \
+            libglib2.0-dev libjson-glib-dev libsoup-3.0-dev libnm-dev
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+      - run: cmake --build build
+      - run: DESTDIR="$PWD/stage" cmake --install build
+
+  nix:
+    name: Nix flake (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: x86_64, runner: ubuntu-latest}
+          - {arch: aarch64, runner: ubuntu-24.04-arm}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24  # v31.11.1
+      - run: nix build -L .#plasma-nm-ts
+      - run: nix flake check
